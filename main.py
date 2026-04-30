@@ -6,12 +6,12 @@ import asyncio
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 
 from context_store import ContextStore
 from compose import compose_tick, compose_reply
 from schemas import ContextRequest, TickRequest, ReplyRequest
+from bootstrap import bootstrap_dataset
 
 
 logging.basicConfig(
@@ -21,48 +21,41 @@ logging.basicConfig(
 log = logging.getLogger("vera")
 
 
-app = FastAPI(title="Vera Bot", version="2.0.0")
+app = FastAPI(title="Vera Bot", version="3.0.0")
 store = ContextStore()
 START_TIME = time.time()
 
 
-TICK_TIMEOUT_S = 25.0
-REPLY_TIMEOUT_S = 25.0
+TICK_TIMEOUT_S = 28.0
+REPLY_TIMEOUT_S = 28.0
+
+
+@app.on_event("startup")
+async def on_startup():
+    import os
+    log.info(f"CWD: {os.getcwd()} | FILE: {os.path.abspath(__file__)}")
+    bootstrap_dataset(store)
+    counts = store.counts()
+    log.info(f"Vera bot ready. Loaded contexts: {counts}")
 
 
 @app.middleware("http")
-async def add_request_logging(request: Request, call_next):
+async def request_logging(request: Request, call_next):
     start = time.time()
-    request_id = request.headers.get("x-request-id", f"req_{int(start*1000)}")
+    rid = request.headers.get("x-request-id", f"req_{int(start*1000)}")
     try:
         response = await call_next(request)
-        elapsed_ms = int((time.time() - start) * 1000)
         log.info(json.dumps({
-            "req_id": request_id,
-            "method": request.method,
-            "path": request.url.path,
-            "status": response.status_code,
-            "elapsed_ms": elapsed_ms,
+            "rid": rid, "method": request.method, "path": request.url.path,
+            "status": response.status_code, "ms": int((time.time() - start) * 1000),
         }))
         return response
     except Exception as e:
-        elapsed_ms = int((time.time() - start) * 1000)
         log.error(json.dumps({
-            "req_id": request_id,
-            "method": request.method,
-            "path": request.url.path,
-            "error": str(e)[:200],
-            "elapsed_ms": elapsed_ms,
+            "rid": rid, "method": request.method, "path": request.url.path,
+            "error": str(e)[:200], "ms": int((time.time() - start) * 1000),
         }))
         return JSONResponse(status_code=500, content={"error": "internal_error"})
-
-
-@app.exception_handler(RequestValidationError)
-async def validation_handler(request: Request, exc: RequestValidationError):
-    return JSONResponse(
-        status_code=400,
-        content={"accepted": False, "reason": "validation_error", "details": str(exc.errors()[:3])}
-    )
 
 
 @app.get("/v1/healthz")
@@ -79,19 +72,20 @@ def healthz():
 def metadata():
     return {
         "team_name": os.environ.get("TEAM_NAME", "Solo"),
-        "team_members": [os.environ.get("CANDIDATE_NAME", "Candidate")],
-        "model": "claude-sonnet-4-20250514",
+        "team_members": [os.environ.get("CANDIDATE_NAME", "Soumyadip Das Mahapatra")],
+        "model": "claude-sonnet-4-5-20250929",
         "approach": (
-            "Deterministic signal-selection pipeline with full category/merchant context grounding. "
-            "Trigger-dispatched prompt construction → Claude (temp=0) → post-LLM validation → "
-            "deterministic per-trigger fallback templates. "
-            "Auto-reply detection (per-merchant counter), explicit intent transition handling, "
-            "graceful hostile exit with apology, off-topic redirect. "
-            "Production hardening: TTL-based GC, retry+backoff on LLM 429/5xx, idempotent tick, "
-            "thread-safe state, structured logging, request validation."
+            "Deterministic signal-selection pipeline with full category/merchant grounding. "
+            "Bundled base dataset for cold-start tick autonomy. "
+            "Trigger-dispatched prompt → Claude (temp=0) → post-LLM validation → "
+            "26 deterministic per-trigger fallback templates. "
+            "Customer-aware reply mode (uses customer name when from_role=customer or customer_id present). "
+            "Auto-reply detection (per-merchant counter), explicit intent transition, hostile/STOP handling, "
+            "off-topic redirect. Production hardening: TTL-based GC, retry+backoff on LLM 429/5xx, "
+            "idempotent tick, thread-safe state, structured logging."
         ),
-        "contact_email": os.environ.get("CONTACT_EMAIL", "candidate@example.com"),
-        "version": "2.0.0",
+        "contact_email": os.environ.get("CONTACT_EMAIL", "soumyagle@gmail.com"),
+        "version": "3.0.0",
         "submitted_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -107,14 +101,11 @@ async def context_endpoint(request: Request):
         })
 
     result = store.upsert(req.scope, req.context_id, req.version, req.payload)
-
     if result == "stale":
         return JSONResponse(status_code=409, content={
-            "accepted": False,
-            "reason": "stale_version",
+            "accepted": False, "reason": "stale_version",
             "current_version": store.get_version(req.scope, req.context_id),
         })
-
     return {
         "accepted": True,
         "ack_id": f"ack_{req.context_id}_v{req.version}",
@@ -133,20 +124,33 @@ async def tick_endpoint(request: Request):
         })
 
     now = req.now or datetime.now(timezone.utc).isoformat()
-    triggers_key = ",".join(sorted(req.available_triggers))
-    idempotency_key = f"{now}|{triggers_key}"
+    available = req.available_triggers
 
+    if not available:
+        all_triggers = store.all_of("trigger")
+        candidates = []
+        for tid, t in all_triggers.items():
+            supp_key = t.get("suppression_key", tid)
+            if store.is_suppressed(supp_key):
+                continue
+            urgency = t.get("urgency", 3)
+            candidates.append((urgency, tid))
+        candidates.sort(key=lambda x: -x[0])
+        available = [tid for _, tid in candidates[:20]]
+
+    triggers_key = ",".join(sorted(available))
+    idempotency_key = f"{now}|{triggers_key}"
     cached = store.check_tick_idempotency(idempotency_key)
     if cached is not None:
         return {"actions": cached}
 
     try:
         actions = await asyncio.wait_for(
-            asyncio.to_thread(compose_tick, store, req.available_triggers, now),
+            asyncio.to_thread(compose_tick, store, available, now),
             timeout=TICK_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
-        log.warning(f"tick_timeout idempotency={idempotency_key[:80]}")
+        log.warning(f"tick_timeout key={idempotency_key[:80]}")
         return {"actions": []}
     except Exception as e:
         log.error(f"tick_error: {e}")
@@ -167,7 +171,6 @@ async def reply_endpoint(request: Request):
         })
 
     received_at = req.received_at or datetime.now(timezone.utc).isoformat()
-
     try:
         result = await asyncio.wait_for(
             asyncio.to_thread(
@@ -187,8 +190,8 @@ async def reply_endpoint(request: Request):
     except asyncio.TimeoutError:
         log.warning(f"reply_timeout conv={req.conversation_id}")
         return {"action": "wait", "wait_seconds": 1800,
-                "rationale": "Reply processing timed out; backing off briefly."}
+                "rationale": "Reply processing timed out; brief backoff."}
     except Exception as e:
         log.error(f"reply_error: {e}")
         return {"action": "wait", "wait_seconds": 1800,
-                "rationale": f"Reply error fallback: {str(e)[:80]}"}
+                "rationale": f"Reply error: {str(e)[:80]}"}
