@@ -405,6 +405,18 @@ def _compose_action(trigger, merchant, category, customer, merchant_id, customer
 
 
 def compose_tick(store: ContextStore, available_triggers: list, now: str) -> list:
+    if not available_triggers:
+        all_triggers = store.all_of("trigger")
+        candidates = []
+        for tid, t in all_triggers.items():
+            supp_key = t.get("suppression_key", tid)
+            if store.is_suppressed(supp_key):
+                continue
+            urgency = t.get("urgency", 3)
+            candidates.append((urgency, tid))
+        candidates.sort(key=lambda x: -x[0])
+        available_triggers = [tid for _, tid in candidates[:20]]
+
     scored = []
     for trg_id in available_triggers:
         trigger = store.get("trigger", trg_id)
@@ -544,3 +556,4 @@ def compose_reply(store: ContextStore, conversation_id, merchant_id, customer_id
             "cta": "binary_yes_no",
             "rationale": f"LLM error fallback ({str(e)[:60]}); using neutral continuation prompt.",
         }
+
