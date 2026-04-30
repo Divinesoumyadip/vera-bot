@@ -5,6 +5,7 @@ Production-grade message engine. FastAPI server implementing all 5 required endp
 ## Architecture
 
 **Signal-selection pipeline → LLM writer** (not LLM thinker).
+<img width="1280" height="428" alt="image" src="https://github.com/user-attachments/assets/eb0fe177-2512-43a9-970d-388b38bf9a12" />
 
 Decisions happen deterministically in Python before the LLM is called:
 
@@ -24,6 +25,7 @@ Decisions happen deterministically in Python before the LLM is called:
 - **Engaged** → LLM-handled with full conversation context
 
 ## Production hardening
+<img width="1280" height="608" alt="image" src="https://github.com/user-attachments/assets/0536a279-aaac-43b5-b9e6-e2dd8437dce9" />
 
 - Pydantic request validation on all endpoints (400 on bad input, no crashes)
 - Async timeouts: 25s on /tick and /reply (judge spec is 30s)
