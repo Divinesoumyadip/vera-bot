@@ -1,13 +1,11 @@
 # Vera Bot - magicpin AI Challenge
+<img width="923" height="193" alt="image" src="https://github.com/user-attachments/assets/5714df8a-d25b-4964-8771-2c4ac978a7ad" />
+
 
 Production-grade message engine. FastAPI server implementing all 5 required endpoints.
 
 
 ## Architecture
-
-<img width="923" height="193" alt="image" src="https://github.com/user-attachments/assets/5714df8a-d25b-4964-8771-2c4ac978a7ad" />
-
-
 **Signal-selection pipeline → LLM writer** (not LLM thinker).
 <img width="1280" height="428" alt="image" src="https://github.com/user-attachments/assets/eb0fe177-2512-43a9-970d-388b38bf9a12" />
 
@@ -19,6 +17,8 @@ Decisions happen deterministically in Python before the LLM is called:
 4. **LLM composition** — Claude Sonnet 4 at `temperature=0`. Writer only.
 5. **Validation** — taboo words, URLs, multi-CTA, internal jargon, re-introductions, missing specificity anchor → all rejected, fallback fires.
 6. **Fallback** — 26 deterministic per-trigger templates that pull real data (peer stats, batch numbers, dates, offer titles, review themes).
+                            <img width="350" height="815" alt="image" src="https://github.com/user-attachments/assets/c2a83757-03a5-4369-9e25-498cd14119b3" />
+
 
 ## Reply handling FSM
 
