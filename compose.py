@@ -511,7 +511,9 @@ def compose_reply(store: ContextStore, conversation_id, merchant_id, customer_id
     history = conv.get("history", [])
     trigger_kind = conv.get("trigger_kind", "general")
 
-    if is_customer_facing and customer:
+    if is_customer_facing:
+        if not customer:
+            customer = {"identity": {"name": "there"}, "relationship": {}}
         if intent in ("positive", "booking_request"):
             return _customer_reply_fallback(message, customer, merchant, intent)
         if intent == "off_topic":
@@ -582,3 +584,4 @@ def compose_reply(store: ContextStore, conversation_id, merchant_id, customer_id
             "cta": "binary_confirm_cancel",
             "rationale": f"LLM error fallback: {str(e)[:60]}",
         }
+
