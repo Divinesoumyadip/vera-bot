@@ -2,7 +2,11 @@
 
 Production-grade message engine. FastAPI server implementing all 5 required endpoints.
 
+
 ## Architecture
+
+<img width="923" height="193" alt="image" src="https://github.com/user-attachments/assets/5714df8a-d25b-4964-8771-2c4ac978a7ad" />
+
 
 **Signal-selection pipeline → LLM writer** (not LLM thinker).
 <img width="1280" height="428" alt="image" src="https://github.com/user-attachments/assets/eb0fe177-2512-43a9-970d-388b38bf9a12" />
