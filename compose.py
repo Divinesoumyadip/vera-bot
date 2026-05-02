@@ -3,9 +3,8 @@ from datetime import datetime, timezone
 from typing import Optional
 from context_store import ContextStore
 from category import get_category_rules, get_trigger_strategy
-from prompts import COMPOSER_SYSTEM, COMPOSER_REPLY_SYSTEM, build_compose_prompt, build_reply_prompt
+from prompts import COMPOSER_SYSTEM, COMPOSER_REPLY_SYSTEM, build_compose_prompt, build_reply_prompt, compute_lead_score, get_gbp_optimization_message, build_review_reply_prompt, REVIEW_REPLY_SYSTEM, get_language_voice, format_for_whatsapp
 from llm import call_llm_json
-
 
 AUTO_REPLY_PHRASES = [
     "thank you for contacting", "thanks for contacting",
@@ -19,75 +18,54 @@ AUTO_REPLY_PHRASES = [
 
 POSITIVE_INTENT = [
     "yes please", "yes please send", "haan bhejo", "haan kar do",
-    "go ahead", "let's do it", "lets do it", "let us do it",
-    "ok do it", "okay do it", "ok lets do", "ok let's do",
-    "please do", "please send", "send it", "do it",
-    "send the abstract", "draft it", "draft the", "send me",
-    "schedule it", "i confirm", "confirm karo",
-    "chalega", "kar do", "bhej do", "bhejo",
-    "sounds good", "sounds great", "perfect", "looks good",
-    "ok please", "okay please", "go for it",
-    "what's next", "whats next", "what next",
-    "yes book", "yes please book", "please book",
+    "go ahead", "let's do it", "lets do it", "ok do it", "okay do it",
+    "please do", "please send", "send it", "do it", "send me",
+    "schedule it", "i confirm", "chalega", "kar do", "bhej do", "bhejo",
+    "sounds good", "perfect", "ok please", "go for it",
+    "what's next", "whats next", "yes book", "please book",
 ]
 
 NEGATIVE_INTENT = [
     "not interested", "stop messaging", "stop sending", "stop",
     "don't message", "dont message", "don't contact", "dont contact",
     "remove me", "unsubscribe", "leave me alone",
-    "stop bothering", "useless spam", "this is spam",
-    "this is useless", "why are you bothering", "block this",
+    "stop bothering", "useless spam", "this is useless",
     "mat bhejo", "band karo", "rok do",
 ]
+
+BOOKING_KEYWORDS = ["book", "schedule", "appointment", "slot", "wed", "thu", "fri", "mon", "tue", "sat", "6pm", "7pm", "morning", "evening"]
 
 OFF_TOPIC_KEYWORDS = [
     "gst filing", "gst return", "income tax", "personal loan",
     "credit card", "stock market", "crypto", "real estate",
 ]
 
-HELP_REQUEST = [
-    "need help", "can you help", "please help", "help me",
-    "audit", "review", "analyze", "look at this", "check this",
-]
-
-BOOKING_REQUEST = [
-    "book me", "book it", "schedule", "appointment", "reserve",
-    "slot", "time", "wed", "thu", "fri", "mon", "tue", "sat", "sun",
-    "morning", "evening", "afternoon", "tonight", "tomorrow",
-]
-
-
 def normalize(s: str) -> str:
     return re.sub(r"\s+", " ", s.lower().strip())
-
 
 def is_auto_reply(message: str) -> bool:
     n = normalize(message)
     return any(p in n for p in AUTO_REPLY_PHRASES)
 
-
 def detect_intent(message: str) -> str:
     if is_auto_reply(message):
         return "auto_reply"
     n = normalize(message)
-    if "stop" == n or n.startswith("stop ") or " stop" in n.split("stop")[-1][:1] if "stop" in n else False:
-        pass
     if any(p in n for p in NEGATIVE_INTENT):
         return "negative"
     if any(p in n for p in POSITIVE_INTENT):
         return "positive"
-    if any(p in n for p in BOOKING_REQUEST) and any(p in n for p in ("book", "schedule", "slot", "appointment")):
-        return "booking_request"
-    if any(p in n for p in HELP_REQUEST):
-        return "help_request"
     if any(p in n for p in OFF_TOPIC_KEYWORDS):
         return "off_topic"
-    if n in ("yes", "haan", "ok", "okay", "sure", "yep", "yup", "y"):
+    if n in ("yes", "haan", "ok", "okay", "sure", "yep", "y"):
         return "positive"
     if n in ("no", "nahi", "nope", "n", "stop"):
         return "negative"
     return "neutral"
 
+def is_booking(message: str) -> bool:
+    n = normalize(message)
+    return any(k in n for k in BOOKING_KEYWORDS)
 
 def score_trigger(trigger: dict, merchant: dict, category: dict) -> float:
     score = 0.4
@@ -98,7 +76,6 @@ def score_trigger(trigger: dict, merchant: dict, category: dict) -> float:
         score += 0.15
     elif not trig_cat:
         score += 0.05
-
     signals = merchant.get("signals", [])
     kind = trigger.get("kind", "")
     alignments = {
@@ -108,8 +85,6 @@ def score_trigger(trigger: dict, merchant: dict, category: dict) -> float:
         "regulation_change": ["compliance_due"],
         "dormant_with_vera": ["dormant", "no_recent_activity"],
         "review_theme_emerged": ["review_pending", "rating_dip"],
-        "stale_posts": ["stale_posts"],
-        "gbp_unverified": ["unverified", "gbp_incomplete"],
     }
     if kind in alignments:
         for sig_marker in alignments[kind]:
@@ -122,21 +97,15 @@ def score_trigger(trigger: dict, merchant: dict, category: dict) -> float:
         score += 0.1
     return min(score, 1.0)
 
-
 def resolve_digest_item(trigger: dict, category: dict) -> Optional[dict]:
     top_item_id = trigger.get("payload", {}).get("top_item_id")
     if not top_item_id:
         return None
     return next((i for i in category.get("digest", []) if i.get("id") == top_item_id), None)
 
+INTERNAL_JARGON = ["suppression_key", "trigger_id", "merchant_id", "context_id", "ack_id"]
 
-INTERNAL_JARGON = [
-    "suppression_key", "trigger_id", "merchant_id", "context_id",
-    "rationale", "send_as", "ack_id",
-]
-
-
-def validate_message(body: str, merchant: dict, category: dict, customer: Optional[dict] = None) -> tuple[bool, str]:
+def validate_message(body: str, merchant: dict, category: dict) -> tuple[bool, str]:
     if not body or len(body.strip()) < 25:
         return False, "body too short"
     body_lower = body.lower()
@@ -146,36 +115,19 @@ def validate_message(body: str, merchant: dict, category: dict, customer: Option
             return False, f"taboo word: {t}"
     if re.search(r'https?://', body):
         return False, "URL in body"
-    if "i'm vera" in body_lower or "i am vera" in body_lower or "this is vera" in body_lower:
+    if "i'm vera" in body_lower or "i am vera" in body_lower:
         return False, "re-introduction"
     for j in INTERNAL_JARGON:
         if j in body_lower:
             return False, f"internal jargon: {j}"
-    cta_count = body.count("Reply YES") + body.count("Reply NO") + body.count("reply 1") + body.count("reply 2")
-    if cta_count > 2:
-        return False, "multi-CTA"
-
+    owner = (merchant.get("identity", {}).get("owner_first_name", "") or
+             merchant.get("identity", {}).get("name", ""))
     has_number = bool(re.search(r'\d', body))
-
-    if customer:
-        cust_first = (customer.get("identity", {}).get("name", "") or "").split()[0].lower()
-        if cust_first and cust_first in body_lower:
-            return True, ""
-        merch_first = (merchant.get("identity", {}).get("owner_first_name", "") or "").split()[0].lower()
-        if merch_first and merch_first in body_lower:
-            return False, f"customer-facing message used merchant name '{merch_first}' instead of customer '{cust_first}'"
-        if has_number:
-            return True, ""
-        return False, "no customer name or number"
-    else:
-        owner = (merchant.get("identity", {}).get("owner_first_name", "") or
-                 merchant.get("identity", {}).get("name", ""))
-        first_name = owner.split()[0].lower() if owner else ""
-        has_name = first_name in body_lower if first_name else False
-        if not has_number and not has_name:
-            return False, "no specificity anchor"
-        return True, ""
-
+    first_name = owner.split()[0].lower() if owner else ""
+    has_name = first_name in body_lower if first_name else False
+    if not has_number and not has_name:
+        return False, "no specificity anchor"
+    return True, ""
 
 def build_fallback(merchant: dict, trigger: dict, category: dict, customer: Optional[dict]) -> dict:
     identity = merchant.get("identity", {})
@@ -222,57 +174,56 @@ def build_fallback(merchant: dict, trigger: dict, category: dict, customer: Opti
             cust_name = customer.get("identity", {}).get("name", "there")
             merch_name = identity.get("name", "us")
             offer = active_offers[0] if active_offers else "your scheduled service"
-            last = customer.get("relationship", {}).get("last_visit", "")
-            body = f"Hi {cust_name}, {merch_name} here. {('It has been since ' + last) if last else 'Time for your next visit'} — {offer}. Reply YES to confirm a slot or share a preferred time."
+            body = f"Hi {cust_name}, {merch_name} here. Time for your next visit — {offer}. Reply YES to confirm a slot."
         else:
-            body = f"{owner}, customer recalls are due. Want me to draft and send reminders to the eligible list?"
+            body = f"{owner}, customer recalls are due. Want me to draft and send reminders?"
         cta = "binary_yes_no"
     elif kind == "chronic_refill_due":
         if customer:
             cust_name = customer.get("identity", {}).get("name", "there")
             merch_name = identity.get("name", "us")
-            body = f"Namaste {cust_name}, {merch_name} yahan. Your monthly refill is due. Same dose, ready for delivery to your saved address. Reply CONFIRM to dispatch."
+            body = f"Namaste {cust_name}, {merch_name} yahan. Your monthly refill is due. Reply CONFIRM to dispatch."
         else:
-            body = f"{owner}, chronic refills are due for your customers. Want me to send the reminder list?"
+            body = f"{owner}, chronic refills are due. Want me to send the reminder list?"
         cta = "binary_confirm"
     elif kind == "appointment_tomorrow":
         if customer:
             cust_name = customer.get("identity", {}).get("name", "there")
             merch_name = identity.get("name", "us")
-            body = f"Hi {cust_name}, this is a reminder from {merch_name} — your appointment is tomorrow. Reply CONFIRM to keep the slot or RESCHEDULE if needed."
+            body = f"Hi {cust_name}, reminder from {merch_name} — your appointment is tomorrow. Reply CONFIRM to keep the slot."
         else:
-            body = f"{owner}, you have customer appointments tomorrow. Want me to send the reminder batch?"
+            body = f"{owner}, appointments tomorrow. Want me to send the reminder batch?"
         cta = "binary_confirm"
     elif kind in ("customer_lapsed_soft", "customer_lapsed_hard"):
         if customer:
             cust_name = customer.get("identity", {}).get("name", "there")
             merch_name = identity.get("name", "us")
             offer = active_offers[0] if active_offers else "a fresh start"
-            body = f"Hi {cust_name}, {merch_name} here — no judgment, just checking in. We have {offer} ready when you are. Reply YES to book — no commitment."
+            body = f"Hi {cust_name}, {merch_name} here — no judgment, just checking in. {offer} ready when you are. Reply YES — no commitment."
         else:
             lapsed = customer_agg.get("lapsed_180d_plus", "many")
-            body = f"{owner}, {lapsed} customers haven't visited in 6+ months. Want me to draft a no-guilt winback message?"
+            body = f"{owner}, {lapsed} customers haven't visited in 6+ months. Want me to draft a winback message?"
         cta = "binary_yes_no"
     elif kind == "curious_ask_due":
-        body = f"{owner}, quick check — what service has been most asked-for this week at {identity.get('name', 'your business')}? I'll turn the answer into a Google post + a customer reply template. 5 min."
+        body = f"{owner}, quick check — what service has been most asked-for this week at {identity.get('name', 'your business')}? I'll turn it into a Google post + customer reply template. 5 min."
         cta = "open_ended"
     elif kind == "festival_upcoming":
         payload = trigger.get("payload", {})
         festival = payload.get("festival_name", "the festival")
         days = payload.get("days_until", "")
         offer = active_offers[0] if active_offers else "a campaign offer"
-        body = f"{owner}, {festival} is {(str(days) + ' days away') if days else 'coming up'}. Want me to draft a campaign around your '{offer}'?"
+        body = f"{owner}, {festival} is {(str(days) + ' days away') if days else 'coming up'}. Want me to draft a campaign around '{offer}'?"
         cta = "binary_yes_no"
     elif kind == "ipl_match_today":
         payload = trigger.get("payload", {})
         match = payload.get("match", "the match tonight")
         offer = active_offers[0] if active_offers else "your active offer"
-        body = f"{owner}, {match} tonight. Want me to draft a delivery-only special around '{offer}' + an Insta story? Live in 10 min."
+        body = f"{owner}, {match} tonight. Want me to draft a special around '{offer}'? Live in 10 min."
         cta = "binary_yes_no"
     elif kind == "active_planning_intent":
         payload = trigger.get("payload", {})
         topic = payload.get("topic", "the plan we discussed")
-        body = f"{owner}, here's a starter draft for {topic} — you can edit. Want me to send the full version with pricing tiers?"
+        body = f"{owner}, starter draft for {topic} ready. Want me to send the full version with pricing tiers?"
         cta = "binary_confirm_cancel"
     elif kind == "supply_alert":
         payload = trigger.get("payload", {})
@@ -280,65 +231,64 @@ def build_fallback(merchant: dict, trigger: dict, category: dict, customer: Opti
         batches = payload.get("batches", [])
         affected = customer_agg.get("chronic_rx_count", "your chronic Rx customers")
         batch_str = ", ".join(batches[:2]) if batches else ""
-        body = f"{owner}, urgent: voluntary recall on {molecule}{(' batches ' + batch_str) if batch_str else ''}. {affected} of your customers may be affected. Want me to draft the customer notification + replacement workflow?"
+        body = f"{owner}, urgent: recall on {molecule}{(' batches ' + batch_str) if batch_str else ''}. {affected} customers may be affected. Want me to draft the notification?"
         cta = "binary_yes_no"
     elif kind == "review_theme_emerged":
         themes = merchant.get("review_themes", [])
         if themes:
             t = themes[0]
-            body = f"{owner}, '{t.get('theme')}' has come up {t.get('occurrences_30d', '?')}× in your last 30d reviews ({t.get('sentiment')}). Want me to draft a public response template?"
+            body = f"{owner}, '{t.get('theme')}' came up {t.get('occurrences_30d', '?')}× in 30d reviews ({t.get('sentiment')}). Want me to draft a response template?"
         else:
-            body = f"{owner}, a review theme is emerging in your recent feedback. Want me to surface the pattern + suggest a response?"
+            body = f"{owner}, a review theme is emerging. Want me to surface the pattern?"
         cta = "binary_yes_no"
     elif kind == "milestone_reached":
         payload = trigger.get("payload", {})
         milestone = payload.get("milestone", "a milestone")
-        body = f"{owner}, congrats — {milestone}! Want me to draft a celebration post for your Google profile + WhatsApp customers?"
+        body = f"{owner}, congrats — {milestone}! Want me to draft a celebration post?"
         cta = "binary_yes_no"
     elif kind == "competitor_opened":
         payload = trigger.get("payload", {})
         distance = payload.get("distance_km", "nearby")
-        body = f"{owner}, a new {category.get('slug', 'business')} opened {distance}km from you in {locality}. Want me to draft a differentiation play based on your strongest review themes?"
+        body = f"{owner}, a new {category.get('slug', 'business')} opened {distance}km away in {locality}. Want me to draft a differentiation play?"
         cta = "binary_yes_no"
     elif kind == "renewal_due":
         days = merchant.get("subscription", {}).get("days_remaining", "soon")
-        body = f"{owner}, your magicpin Pro renews in {days} days. Quick recap of value delivered last cycle is ready. Want to see it before deciding?"
+        body = f"{owner}, your magicpin Pro renews in {days} days. Value recap ready. Want to see it?"
         cta = "binary_yes_no"
     elif kind == "dormant_with_vera":
-        body = f"{owner}, haven't heard from you in a while. Quick one — what's the #1 thing you'd want my help with this week? I can draft posts, reply templates, or pull peer benchmarks."
+        body = f"{owner}, haven't heard from you in a while. What's the #1 thing you'd want help with this week?"
         cta = "open_ended"
     elif kind == "category_seasonal":
         beat = seasonal[0] if seasonal else {}
         note = beat.get("note", "a seasonal demand pattern")
-        body = f"{owner}, {note}. Want me to prep a campaign before the peak window?"
+        body = f"{owner}, {note}. Want me to prep a campaign before the peak?"
         cta = "binary_yes_no"
     elif kind == "gbp_unverified":
-        body = f"{owner}, your Google Business Profile is unverified — that caps your local search reach. 5-min verification. Want me to walk you through it now?"
+        body = f"{owner}, your Google Business Profile is unverified — caps your local reach. 5-min fix. Want me to walk you through it?"
         cta = "binary_yes_no"
     elif kind == "cde_opportunity":
         items = category.get("digest", [])
         item = next((i for i in items if "webinar" in (i.get("title", "").lower())), items[0] if items else {})
         title = item.get("title", "a relevant CDE opportunity")
-        body = f"{owner}, {title}. Aapke practice ke liye relevant. Want me to send the registration details?"
+        body = f"{owner}, {title}. Aapke practice ke liye relevant. Want me to send the details?"
         cta = "binary_yes_no"
     elif kind == "winback_eligible":
         if customer:
             cust_name = customer.get("identity", {}).get("name", "there")
             merch_name = identity.get("name", "us")
             offer = active_offers[0] if active_offers else "a welcome-back offer"
-            body = f"Hi {cust_name}, {merch_name} here — been a while! No commitment, but {offer} is ready if you want to give us another try. Reply YES — that's it."
+            body = f"Hi {cust_name}, {merch_name} here — been a while! {offer} ready if you want to try again. Reply YES — no commitment."
         else:
-            body = f"{owner}, you have winback-eligible customers. Want me to draft a no-guilt re-engagement?"
+            body = f"{owner}, winback-eligible customers waiting. Want me to draft a re-engagement?"
         cta = "binary_yes_no"
     else:
         if active_offers:
-            body = f"{owner}, your '{active_offers[0]}' is doing the work — want me to draft a peer-comparison post showing how it stacks up in {locality}?"
+            body = f"{owner}, your '{active_offers[0]}' is doing the work — want me to draft a peer-comparison post in {locality}?"
         else:
-            body = f"{owner}, quick one. Your {locality} profile has new signals worth a look. Want me to walk you through them?"
+            body = f"{owner}, your {locality} profile has new signals. Want me to walk you through them?"
         cta = "open_ended"
 
     return {"body": body, "cta": cta, "rationale": f"Deterministic fallback for trigger kind '{kind}'."}
-
 
 def _compose_action(trigger, merchant, category, customer, merchant_id, customer_id):
     kind = trigger.get("kind", "")
@@ -366,18 +316,39 @@ def _compose_action(trigger, merchant, category, customer, merchant_id, customer
         fb = build_fallback(merchant, trigger, category, customer)
         body, cta, rationale = fb["body"], fb["cta"], fb["rationale"] + f" (LLM unavailable: {str(e)[:60]})"
 
-    valid, reason = validate_message(body, merchant, category, customer)
+    valid, reason = validate_message(body, merchant, category)
     if not valid:
         fb = build_fallback(merchant, trigger, category, customer)
         body, cta, rationale = fb["body"], fb["cta"], fb["rationale"] + f" (validation: {reason})"
 
     identity = merchant.get("identity", {})
     name_part = identity.get("owner_first_name") or identity.get("name", "")
-    if customer:
-        name_part = customer.get("identity", {}).get("name", name_part)
     supp_key = trigger.get("suppression_key", f"{merchant_id}:{kind}:{date_part}")
 
-    return {
+    gbp_hint = None
+    if kind in ("gbp_unverified", "review_theme_emerged", "dormant_with_vera"):
+        try:
+            gbp_opt = get_gbp_optimization_message(merchant, category)
+            gbp_hint = gbp_opt.get("body", "")
+        except Exception:
+            pass
+
+    review_reply_draft = None
+    if kind == "review_theme_emerged":
+        try:
+            themes = merchant.get("review_themes", [])
+            if themes:
+                review = {"reviewer_name": "a recent customer",
+                         "rating": 4, "text": themes[0].get("theme", "")}
+                rr = call_llm_json(REVIEW_REPLY_SYSTEM,
+                                   build_review_reply_prompt(review, merchant, category),
+                                   max_tokens=200)
+                review_reply_draft = rr.get("reply_text", "")
+        except Exception:
+            pass
+
+    body = format_for_whatsapp(body, cta)
+    result = {
         "conversation_id": conv_id,
         "merchant_id": merchant_id,
         "customer_id": customer_id,
@@ -390,9 +361,25 @@ def _compose_action(trigger, merchant, category, customer, merchant_id, customer
         "suppression_key": supp_key,
         "rationale": rationale,
     }
-
+    if gbp_hint:
+        result["gbp_optimization"] = gbp_hint
+    if review_reply_draft:
+        result["review_reply_draft"] = review_reply_draft
+    return result
 
 def compose_tick(store: ContextStore, available_triggers: list, now: str) -> list:
+    if not available_triggers:
+        all_triggers = store.all_of("trigger")
+        candidates = []
+        for tid, t in all_triggers.items():
+            supp_key = t.get("suppression_key", tid)
+            if store.is_suppressed(supp_key):
+                continue
+            urgency = t.get("urgency", 3)
+            candidates.append((urgency, tid))
+        candidates.sort(key=lambda x: -x[0])
+        available_triggers = [tid for _, tid in candidates[:20]]
+
     scored = []
     for trg_id in available_triggers:
         trigger = store.get("trigger", trg_id)
@@ -423,51 +410,11 @@ def compose_tick(store: ContextStore, available_triggers: list, now: str) -> lis
             store.add_suppression(trigger.get("suppression_key", trg_id))
     return actions
 
-
-def _customer_reply_fallback(message, customer, merchant, intent):
-    cust_name = customer.get("identity", {}).get("name", "there")
-    merch_name = merchant.get("identity", {}).get("name", "us")
-    active_offers = [o["title"] for o in merchant.get("offers", []) if o.get("status") == "active"]
-    n = normalize(message)
-
-    if intent == "booking_request":
-        slot = ""
-        m = re.search(r"(mon|tue|wed|thu|fri|sat|sun)\w*\s*(\d{1,2})", n)
-        time_m = re.search(r"(\d{1,2})\s*(?:am|pm)|(\d{1,2}):(\d{2})", n)
-        if m:
-            slot = m.group(0)
-        if time_m:
-            slot += " " + time_m.group(0)
-        if slot:
-            body = f"Hi {cust_name}, booking confirmed at {merch_name} for {slot.title()}. We'll send a reminder a day before. Reply CONFIRM to lock the slot."
-        else:
-            body = f"Hi {cust_name}, slot received. Confirming with {merch_name} now. Reply CONFIRM to lock or share an alternate time."
-        return {"action": "send", "body": body, "cta": "binary_confirm",
-                "rationale": "Customer booking request acknowledged with name + venue + slot anchor."}
-
-    if intent == "positive":
-        offer = active_offers[0] if active_offers else "your visit"
-        body = f"Hi {cust_name}, perfect — {merch_name} is on it. Sending the confirmation + reminder shortly. Reply CONFIRM to lock the slot."
-        return {"action": "send", "body": body, "cta": "binary_confirm",
-                "rationale": "Customer positive intent → action mode with customer name and merchant name."}
-
-    body = f"Hi {cust_name}, got it — {merch_name} will get back with the next step. Reply YES if you'd like a quick call instead."
-    return {"action": "send", "body": body, "cta": "binary_yes_no",
-            "rationale": "Customer-aware neutral acknowledgement."}
-
-
-def _merchant_help_fallback(message, merchant, category):
-    owner = merchant.get("identity", {}).get("owner_first_name", "")
-    body = f"On it{', ' + owner if owner else ''} — pulling a quick checklist for that. I'll send 3 specific actions ranked by impact in 90 seconds. Reply CONFIRM to receive the playbook."
-    return {"action": "send", "body": body, "cta": "binary_confirm",
-            "rationale": "Merchant requested help; acknowledging and delivering an artifact next."}
-
-
 def compose_reply(store: ContextStore, conversation_id, merchant_id, customer_id,
                   from_role, message, received_at, turn_number) -> dict:
 
     if store.is_conversation_suppressed(conversation_id):
-        return {"action": "end", "rationale": "Conversation suppressed; no further messages."}
+        return {"action": "end", "rationale": "Conversation suppressed."}
 
     store.append_turn(conversation_id, from_role, message)
     intent = detect_intent(message)
@@ -476,100 +423,82 @@ def compose_reply(store: ContextStore, conversation_id, merchant_id, customer_id
         merchant_auto_count = store.bump_merchant_auto_count(merchant_id)
         if merchant_auto_count >= 3:
             store.suppress_conversation(conversation_id)
-            return {"action": "end",
-                    "rationale": f"Auto-reply detected {merchant_auto_count}× from this merchant. Closing."}
+            return {"action": "end", "rationale": f"Auto-reply {merchant_auto_count}x. Closing."}
         if merchant_auto_count == 2:
-            return {"action": "wait", "wait_seconds": 86400,
-                    "rationale": "Second auto-reply. Waiting 24h."}
-        return {"action": "wait", "wait_seconds": 14400,
-                "rationale": "Auto-reply pattern detected. Backing off 4h for the owner."}
+            return {"action": "wait", "wait_seconds": 86400, "rationale": "Auto-reply 2x. Waiting 24h."}
+        return {"action": "wait", "wait_seconds": 14400, "rationale": "Auto-reply detected. Backing off 4h."}
 
     if intent == "negative":
         store.suppress_conversation(conversation_id)
         merchant, _ = store.get_merchant_with_category(merchant_id) if merchant_id else (None, None)
-        if customer_id and not merchant:
-            customer = store.get("customer", customer_id)
-            cust_name = customer.get("identity", {}).get("name", "there") if customer else "there"
-            body = f"Sorry for the bother {cust_name} — I won't message you again. 🙏"
-        else:
-            is_hindi = merchant and "hi" in merchant.get("identity", {}).get("languages", [])
-            if is_hindi:
-                body = "Sorry for the bother. Main aur messages nahi bhejongi. 🙏"
-            else:
-                body = "Sorry for the bother — I won't message again. Reply 'Hi Vera' anytime if anything changes. 🙏"
-        return {"action": "send", "body": body, "cta": "none",
-                "rationale": "Hostile/STOP detected. Apologetic exit. Conversation suppressed."}
+        is_hindi = merchant and "hi" in merchant.get("identity", {}).get("languages", [])
+        body = ("Sorry for the bother. Main aur messages nahi bhejongi. 🙏" if is_hindi
+                else "Sorry for the bother — I won't message again. 🙏")
+        return {"action": "end", "body": body, "cta": "none",
+                "rationale": "Hostile/STOP. Graceful exit. Suppressed."}
 
     merchant, category = store.get_merchant_with_category(merchant_id) if merchant_id else (None, None)
     customer = store.get("customer", customer_id) if customer_id else None
     if not merchant: merchant = {}
     if not category: category = {}
 
-    is_customer_facing = (from_role == "customer") or (customer is not None)
+    if from_role == "customer" or (customer is not None and from_role != "merchant"):
+        cust_name = customer.get("identity", {}).get("name", "there") if customer else "there"
+        merch_name = merchant.get("identity", {}).get("name", "us") if merchant else "us"
+        active_offers = [o["title"] for o in merchant.get("offers", []) if o.get("status") == "active"] if merchant else []
+        voice = get_language_voice(merchant) if merchant else {"greeting": "Hi", "code": "en"}
+        greeting = voice.get("greeting", "Hi") if cust_name and cust_name != "there" else "Hi"
+        lead = compute_lead_score(message, turn_number, [])
+
+        if intent == "negative":
+            return {"action": "end", "body": f"No problem {cust_name} — won't bother you again. 🙏",
+                    "cta": "none", "rationale": "Customer opt-out."}
+
+        if is_booking(message) or intent == "positive":
+            slot_match = re.search(r"(mon|tue|wed|thu|fri|sat|sun)\w*\s*\d{0,2}[a-z]*\s*(?:nov|dec|jan|feb|mar|apr|may|jun|jul|aug|sep|oct)?\s*,?\s*\d{0,2}:?\d{0,2}\s*(?:am|pm)?", message.lower())
+            slot = slot_match.group(0).strip().title() if slot_match else ""
+            if slot:
+                body = f"{greeting} {cust_name}, confirmed at {merch_name} for {slot}.\n\nWe'll send a reminder the day before.\n\nReply CONFIRM to lock the slot."
+            else:
+                offer = active_offers[0] if active_offers else "your visit"
+                body = f"{greeting} {cust_name}, noted — {merch_name} will confirm your slot shortly.\n\nReply CONFIRM to lock it in."
+            return {"action": "send", "body": body, "cta": "binary_confirm",
+                    "lead_score": lead,
+                    "language": voice.get("code", "en"),
+                    "rationale": f"Customer booking. Lead: {lead['label']} ({lead['score']}/100). Lang: {voice.get('code', 'en')}"}
+
+        body = f"{greeting} {cust_name}, got it — {merch_name} will follow up shortly.\n\nReply YES if you need anything else."
+        return {"action": "send", "body": body, "cta": "binary_yes_no",
+                "lead_score": lead,
+                "language": voice.get("code", "en"),
+                "rationale": f"Customer neutral. Lead: {lead['label']}. Lang: {voice.get('code', 'en')}"}
 
     conv = store.get_conversation(conversation_id) or {}
     history = conv.get("history", [])
     trigger_kind = conv.get("trigger_kind", "general")
-
-    if is_customer_facing:
-        if not customer:
-            customer = {"identity": {"name": "there"}, "relationship": {}}
-        if intent in ("positive", "booking_request"):
-            return _customer_reply_fallback(message, customer, merchant, intent)
-        if intent == "off_topic":
-            cust_name = customer.get("identity", {}).get("name", "there")
-            merch_name = merchant.get("identity", {}).get("name", "us")
-            return {"action": "send",
-                    "body": f"Hi {cust_name}, that's outside what {merch_name} can help with directly. Want me to share our menu/services list instead?",
-                    "cta": "binary_yes_no",
-                    "rationale": "Customer off-topic; redirect to actionable next step."}
-        try:
-            prompt = build_reply_prompt(history, message, merchant, category, trigger_kind, turn_number)
-            customer_block = (
-                f"\n\n=== CUSTOMER REPLYING ===\n"
-                f"Name: {customer.get('identity', {}).get('name')}\n"
-                f"Last visit: {customer.get('relationship', {}).get('last_visit', 'unknown')}\n"
-                f"Send-as: merchant_on_behalf — address the CUSTOMER (not the merchant) by name.\n"
-                f"DO NOT use the merchant owner's first name to address them — they are not the recipient."
-            )
-            result = call_llm_json(COMPOSER_REPLY_SYSTEM, prompt + customer_block, max_tokens=400)
-            if result.get("action") == "end":
-                store.suppress_conversation(conversation_id)
-            body = result.get("body", "")
-            cust_first = (customer.get("identity", {}).get("name", "") or "").split()[0].lower()
-            merch_first = (merchant.get("identity", {}).get("owner_first_name", "") or "").split()[0].lower()
-            if merch_first and merch_first in body.lower() and cust_first and cust_first not in body.lower():
-                return _customer_reply_fallback(message, customer, merchant, intent)
-            return result
-        except Exception:
-            return _customer_reply_fallback(message, customer, merchant, intent)
-
+    active_offers = [o["title"] for o in merchant.get("offers", []) if o.get("status") == "active"]
     owner = merchant.get("identity", {}).get("owner_first_name", "")
 
     if intent == "positive":
-        active_offers = [o["title"] for o in merchant.get("offers", []) if o.get("status") == "active"]
         if trigger_kind == "active_planning_intent":
-            body = f"Drafting it now — sending the full version with tiers + an outreach template in 60 seconds. Reply CONFIRM to proceed."
+            body = "Drafting it now — full version with tiers + outreach template in 60 seconds. Reply CONFIRM to proceed."
         elif trigger_kind == "research_digest":
-            body = f"Sending the abstract now — also drafting a patient-ed WhatsApp you can share. Reply CONFIRM to schedule the Google post for tomorrow 10am."
+            body = "Sending the abstract now — also drafting a patient-ed WhatsApp. Reply CONFIRM to schedule Google post for tomorrow 10am."
         elif trigger_kind == "festival_upcoming":
             offer = active_offers[0] if active_offers else "your campaign"
-            body = f"Drafting the {offer} campaign now — full post + WhatsApp template ready in 90 seconds. Reply CONFIRM to launch."
+            body = f"Drafting the {offer} campaign — full post + WhatsApp template in 90 seconds. Reply CONFIRM to launch."
         elif trigger_kind in ("perf_dip", "perf_spike"):
-            body = f"Pulling your full diagnostic now — 3 specific actions ranked by impact, here in 2 minutes. Reply CONFIRM to receive the playbook."
+            body = "Pulling your full diagnostic — 3 actions ranked by impact, here in 2 minutes. Reply CONFIRM to receive the playbook."
         else:
             owner_str = f"{owner}, " if owner else ""
-            body = f"{owner_str}done — drafting now. Sending the full version with one-tap actions in 60 seconds. Reply CONFIRM to proceed."
+            body = f"{owner_str}done — drafting now. Full version with one-tap actions in 60 seconds. Reply CONFIRM to proceed."
         return {"action": "send", "body": body, "cta": "binary_confirm_cancel",
-                "rationale": f"Positive commitment on {trigger_kind}. Action mode, no re-qualification."}
+                "rationale": f"Positive commitment on {trigger_kind}. Action mode. No re-qualification."}
 
     if intent == "off_topic":
-        body = f"That one's outside what I can help with directly{', ' + owner if owner else ''}. Coming back to our thread — want me to take the next step?"
+        body = f"That's outside what I can help with{', ' + owner if owner else ''}. Coming back — want me to take the next step on what we discussed?"
         return {"action": "send", "body": body, "cta": "binary_yes_no",
-                "rationale": "Off-topic redirected back to original thread."}
-
-    if intent == "help_request":
-        return _merchant_help_fallback(message, merchant, category)
+                "rationale": "Off-topic redirected."}
 
     try:
         prompt = build_reply_prompt(history, message, merchant, category, trigger_kind, turn_number)
@@ -578,10 +507,8 @@ def compose_reply(store: ContextStore, conversation_id, merchant_id, customer_id
             store.suppress_conversation(conversation_id)
         return result
     except Exception as e:
-        return _merchant_help_fallback(message, merchant, category) if intent == "help_request" else {
-            "action": "send",
-            "body": f"Got it{', ' + owner if owner else ''}! Reply CONFIRM if you'd like me to take the next step now.",
-            "cta": "binary_confirm_cancel",
-            "rationale": f"LLM error fallback: {str(e)[:60]}",
-        }
-
+        owner_str = f", {owner}" if owner else ""
+        return {"action": "send",
+                "body": f"Got it{owner_str}! Reply CONFIRM to proceed.",
+                "cta": "binary_confirm_cancel",
+                "rationale": f"LLM error fallback: {str(e)[:60]}"}

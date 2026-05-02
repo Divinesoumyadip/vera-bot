@@ -37,7 +37,6 @@ Before writing, identify in your head:
 Respond ONLY as JSON:
 {"body": "...", "cta": "open_ended|binary_yes_no|binary_confirm_cancel|binary_confirm|slot_choice|none", "rationale": "Cite the specific data points used and the compulsion lever applied."}"""
 
-
 COMPOSER_REPLY_SYSTEM = """You are Vera in a live WhatsApp conversation. The merchant or customer just replied. Decide the next move.
 
 DECISION TREE (in order):
@@ -73,12 +72,10 @@ VOICE: Match the merchant's category. Hindi-English mix if their language profil
 Respond ONLY as JSON:
 {"action": "send|wait|end", "body": "...", "cta": "binary_yes_no|binary_confirm_cancel|binary_confirm|open_ended|none", "wait_seconds": <int if action=wait>, "rationale": "..."}"""
 
-
 def _fmt_pct(v):
     if isinstance(v, (int, float)):
         return f"{v*100:+.0f}%"
     return "?"
-
 
 def build_compose_prompt(category, merchant, trigger, customer, strategy, cat_rules, digest_item):
     identity = merchant.get("identity", {})
@@ -221,7 +218,6 @@ Send as: {send_as}
 
 JSON only."""
 
-
 def build_reply_prompt(conversation_history, incoming_message, merchant, category, trigger_kind, turn_number):
     identity = merchant.get("identity", {})
     voice = category.get("voice", {})
@@ -265,3 +261,249 @@ If waiting: pick wait_seconds based on signal strength (auto-reply = 86400; pend
 If ending: one polite line. No last pitch.
 
 JSON only."""
+
+REVIEW_REPLY_SYSTEM = """You are Vera, generating a Google review reply on behalf of an Indian merchant.
+
+RULES:
+- Address the reviewer by name if visible, otherwise "Hi"
+- Thank them specifically for what they mentioned
+- Address any negative point directly and professionally
+- End with an invitation to return
+- Max 3 sentences
+- Match category voice: dentist=clinical, restaurant=warm, salon=friendly, gym=motivational, pharmacy=trustworthy
+- Hindi-English mix OK if merchant prefers Hindi
+- NEVER mention Vera or magicpin
+- Sound like the business owner wrote it personally
+
+Respond ONLY as JSON:
+{"reply_text": "...", "sentiment_handled": "positive|negative|neutral", "rationale": "..."}"""
+
+def build_review_reply_prompt(review: dict, merchant: dict, category: dict) -> str:
+    reviewer = review.get("reviewer_name", "the customer")
+    rating = review.get("rating", 5)
+    text = review.get("text", "")
+    owner = merchant.get("identity", {}).get("owner_first_name", "")
+    biz_name = merchant.get("identity", {}).get("name", "")
+    locality = merchant.get("identity", {}).get("locality", "")
+
+    return f"""Generate a Google review reply for this merchant:
+
+Business: {biz_name} ({locality})
+Owner: {owner}
+Category: {category.get('slug', 'restaurant')}
+Review Rating: {rating}/5
+Reviewer: {reviewer}
+Review Text: "{text}"
+
+Write a personal, warm reply that sounds like {owner or 'the owner'} wrote it."""
+
+GBP_SIGNALS = {
+    "no_description": {
+        "message": "No business description — missing out on 40% more profile views",
+        "action": "Want me to write a 150-word SEO description right now? Takes 60 seconds."
+    },
+    "no_photos": {
+        "message": "No photos on your Google profile — customers skip listings without images",
+        "action": "Send me any photo on WhatsApp and I'll enhance + post it with an SEO caption."
+    },
+    "low_reply_rate": {
+        "message": "5+ unanswered reviews — hurts your ranking by ~15%",
+        "action": "Want me to draft replies to all of them right now?"
+    },
+    "unverified_gbp": {
+        "message": "Google Business Profile unverified — you're invisible in Maps for nearby searches",
+        "action": "5-min fix. Want me to walk you through it?"
+    },
+    "missing_hours": {
+        "message": "Business hours missing — customers can't tell if you're open",
+        "action": "Want me to update your hours on Google?"
+    },
+    "no_offers": {
+        "message": "No active offers on your profile — competitors with offers get 2x more clicks",
+        "action": "Want me to create a Google offer from your existing menu/services?"
+    }
+}
+
+def get_gbp_optimization_message(merchant: dict, category: dict) -> dict:
+    """Generate a profile optimization message based on merchant signals."""
+    identity = merchant.get("identity", {})
+    owner = identity.get("owner_first_name", "") or identity.get("name", "").split()[0]
+    signals = merchant.get("signals", [])
+    offers = [o for o in merchant.get("offers", []) if o.get("status") == "active"]
+    reviews = merchant.get("reviews", [])
+    unanswered = [r for r in reviews if not r.get("reply")]
+
+    if "gbp_incomplete" in str(signals) or "unverified" in str(signals):
+        signal = GBP_SIGNALS["unverified_gbp"]
+    elif not identity.get("description"):
+        signal = GBP_SIGNALS["no_description"]
+    elif len(unanswered) >= 3:
+        signal = GBP_SIGNALS["low_reply_rate"]
+    elif not offers:
+        signal = GBP_SIGNALS["no_offers"]
+    else:
+        signal = GBP_SIGNALS["no_photos"]
+
+    body = f"{owner}, {signal['message']}. {signal['action']}"
+    return {
+        "body": body,
+        "cta": "binary_yes_no",
+        "rationale": f"GBP optimization signal detected. {signal['message']}"
+    }
+
+def compute_lead_score(message: str, turn_number: int, history: list) -> dict:
+    """Score a customer message for lead qualification."""
+    msg_lower = message.lower()
+
+    booking_signals = ["book", "appointment", "slot", "when", "available", "schedule", "reserve"]
+    pricing_signals = ["price", "cost", "how much", "rate", "charges", "fees", "kitna"]
+    intent_signals = ["interested", "want", "need", "looking for", "please", "yes", "confirm"]
+    time_signals = ["today", "tomorrow", "this week", "monday", "tuesday", "wednesday", "thursday", "friday"]
+
+    booking_score = sum(1 for s in booking_signals if s in msg_lower) * 25
+    pricing_score = sum(1 for s in pricing_signals if s in msg_lower) * 20
+    intent_score = sum(1 for s in intent_signals if s in msg_lower) * 15
+    time_score = sum(1 for s in time_signals if s in msg_lower) * 20
+    turn_score = min(turn_number * 10, 30)
+
+    total = min(booking_score + pricing_score + intent_score + time_score + turn_score, 100)
+
+    if total >= 70:
+        stage = "high_intent"
+        label = "Hot Lead"
+    elif total >= 40:
+        stage = "qualified"
+        label = "Warm Lead"
+    elif total >= 20:
+        stage = "interested"
+        label = "Interested"
+    else:
+        stage = "cold"
+        label = "Cold"
+
+    return {
+        "score": total,
+        "stage": stage,
+        "label": label,
+        "signals_detected": {
+            "booking": booking_score > 0,
+            "pricing": pricing_score > 0,
+            "intent": intent_score > 0,
+            "time_preference": time_score > 0
+        }
+    }
+
+LANGUAGE_VOICES = {
+    "hi": {
+        "greeting": "Namaste",
+        "yes_word": "haan",
+        "thanks": "shukriya",
+        "code_mix_phrases": ["aapke", "kar do", "bhej do", "chalega", "bilkul"],
+        "voice_note": "Hindi-English code-mix. Use 'aap' (formal) for owners, devanagari OK if natural."
+    },
+    "ta": {
+        "greeting": "Vanakkam",
+        "yes_word": "aamaa",
+        "thanks": "nandri",
+        "code_mix_phrases": ["ungaluku", "panrom", "seyalaam", "irukku", "vendiyathu"],
+        "voice_note": "Tamil-English mix. Use 'neenga' (formal) for owners. Tanglish (Tamil written in English) is standard for WhatsApp."
+    },
+    "te": {
+        "greeting": "Namaskaram",
+        "yes_word": "avunu",
+        "thanks": "dhanyavadalu",
+        "code_mix_phrases": ["meeku", "cheddam", "untundi", "kavali", "chesthunnam"],
+        "voice_note": "Telugu-English mix. Use 'meeru' (formal). Tenglish is normal for WhatsApp."
+    },
+    "kn": {
+        "greeting": "Namaskara",
+        "yes_word": "howdu",
+        "thanks": "dhanyavadagalu",
+        "code_mix_phrases": ["nimage", "madona", "ide", "beku", "agatte"],
+        "voice_note": "Kannada-English mix. Use 'neevu' (formal). Kanglish for WhatsApp."
+    },
+    "mr": {
+        "greeting": "Namaskar",
+        "yes_word": "ho",
+        "thanks": "dhanyavad",
+        "code_mix_phrases": ["tumhala", "karuya", "ahe", "havya", "karto"],
+        "voice_note": "Marathi-English mix. Use 'tumhi' (formal). Marathi-English is standard."
+    },
+    "ml": {
+        "greeting": "Namaskaram",
+        "yes_word": "athe",
+        "thanks": "nanni",
+        "code_mix_phrases": ["ningalkku", "cheyyam", "undu", "venam", "cheyunnu"],
+        "voice_note": "Malayalam-English mix. Use 'ningal' (formal)."
+    },
+    "bn": {
+        "greeting": "Namaskar",
+        "yes_word": "ha",
+        "thanks": "dhonnobad",
+        "code_mix_phrases": ["apnar", "kore debo", "ache", "lagbe", "korchi"],
+        "voice_note": "Bengali-English mix. Use 'apni' (formal). Banglish for WhatsApp."
+    },
+    "gu": {
+        "greeting": "Namaste",
+        "yes_word": "haa",
+        "thanks": "aabhar",
+        "code_mix_phrases": ["tamne", "karishu", "che", "joiye", "karu chu"],
+        "voice_note": "Gujarati-English mix. Use 'tame' (formal)."
+    },
+    "pa": {
+        "greeting": "Sat Sri Akal",
+        "yes_word": "haanji",
+        "thanks": "shukriya",
+        "code_mix_phrases": ["tuhanu", "kar diyange", "hai", "chahida", "karde haan"],
+        "voice_note": "Punjabi-English mix. Use 'tusi' (formal). Romanized Punjabi for WhatsApp."
+    },
+    "or": {
+        "greeting": "Namaskar",
+        "yes_word": "han",
+        "thanks": "dhanyabad",
+        "code_mix_phrases": ["apananku", "karibu", "achi", "darkar", "karuchu"],
+        "voice_note": "Odia-English mix. Use 'apana' (formal)."
+    },
+    "en": {
+        "greeting": "Hi",
+        "yes_word": "yes",
+        "thanks": "thanks",
+        "code_mix_phrases": [],
+        "voice_note": "Pure English. Casual professional tone for WhatsApp."
+    }
+}
+
+def get_language_voice(merchant: dict) -> dict:
+    """Pick the dominant language voice for this merchant."""
+    languages = merchant.get("identity", {}).get("languages", [])
+    priority = ["ta", "te", "kn", "mr", "ml", "bn", "gu", "pa", "or", "hi", "en"]
+    for lang in priority:
+        if lang in languages:
+            return {**LANGUAGE_VOICES[lang], "code": lang}
+    return {**LANGUAGE_VOICES["en"], "code": "en"}
+
+def format_for_whatsapp(body: str, cta: str = "") -> str:
+    """Format message in WhatsApp-native style: short paragraphs, line breaks."""
+    if not body:
+        return body
+
+    parts = body.split(" — ")
+    if len(parts) >= 2:
+        hook = parts[0].strip()
+        rest = " — ".join(parts[1:]).strip()
+        import re
+        cta_match = re.search(r'(Reply [A-Z]+|Want me to [^?]+\?|.+\?)$', rest)
+        if cta_match:
+            cta_text = cta_match.group(0)
+            detail = rest[:cta_match.start()].strip().rstrip('.')
+            if detail:
+                return f"{hook}.\n\n{detail}.\n\n{cta_text}"
+            return f"{hook}.\n\n{cta_text}"
+        return f"{hook}.\n\n{rest}"
+
+    if len(body) > 120:
+        sentences = body.split('. ')
+        if len(sentences) >= 3:
+            return f"{sentences[0]}.\n\n{'. '.join(sentences[1:])}"
+
+    return body
