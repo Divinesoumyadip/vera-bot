@@ -1,4 +1,4 @@
-# Vera Bot — magicpin AI Challenge
+# Vera Bot - magicpin AI Challenge
 
 Production-grade message engine. FastAPI server implementing all 5 required endpoints.
 
