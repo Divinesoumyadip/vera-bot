@@ -1,4 +1,4 @@
-# Vera Bot — magicpin AI Challenge
+# Vera Bot - magicpin AI Challenge
 
 My submission for the magicpin Vera AI Challenge. Live at [vera-bot-yuqy.onrender.com](https://vera-bot-yuqy.onrender.com).
 
