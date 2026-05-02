@@ -5,6 +5,30 @@
 Production-grade message engine. FastAPI server implementing all 5 required endpoints.
 
 
+## Why this approach
+
+The naive way is to dump everything into the LLM and pray. That gives generic 
+output. I split it: Python decides *what* to send and *when*, LLM only writes 
+the words. Means I get determinism + good copy.
+
+
+## Tradeoffs I'm aware of
+
+- In-memory store loses state on restart. Fine for the challenge, would use 
+  Redis in prod.
+- Customer reply path took 3 iterations. First version branched on customer_id, 
+  second on customer object, finally just on from_role.
+- Fallback templates are verbose. Could compress with a template DSL but didn't 
+  have time.
+
+## Stuff I'd add with more time
+
+- Per-merchant learning (track which triggers each merchant engages with)
+- Better Hindi-English code-mix tuning (current version sometimes sounds robotic)
+- Real metrics endpoint, not just logs
+
+
+
 ## Architecture
 **Signal-selection pipeline → LLM writer** (not LLM thinker).
 <img width="1280" height="428" alt="image" src="https://github.com/user-attachments/assets/eb0fe177-2512-43a9-970d-388b38bf9a12" />
